@@ -12,9 +12,13 @@ from .schemas import (
     DomainRetentionPlanItem,
     DomainRetentionPlanRequest,
     DomainRetentionPlanResponse,
+    DomainReachedAtItem,
     DomainSummary,
     ObservationTransition,
     OrderedDelta,
+    PropagationSloItem,
+    PropagationSloRequest,
+    PropagationSloResponse,
     ProposeItem,
     ProposeRequest,
     ProposeResponse,
@@ -35,8 +39,10 @@ from .serial import (
     build_delta_chain,
     build_sized_delta_chain,
     check_observation_time_order,
+    check_release_time_order,
     compare_serial,
     DeltaValidationError,
+    evaluate_propagation_slo,
     evaluate_rollout_gate,
     forward_distance,
     ObservationOrderError,
@@ -44,6 +50,7 @@ from .serial import (
     plan_retention,
     plan_transfer,
     propose_serial,
+    ReleaseOrderError,
 )
 
 app = FastAPI(
@@ -52,9 +59,10 @@ app = FastAPI(
         "基于 RFC 1982 环形算术，对多个 DNS 副本的 SOA 序列号推进进行审计，"
         "推导对所有副本都严格更新的最佳拟发布值，规划增量 / 全量传输，"
         "在字节预算内选择要保留的增量集合（支持按故障域公平分配），"
-        "并按时间序列观测对上线做 quorum 门禁判定。"
+        "按时间序列观测对上线做 quorum 门禁判定，"
+        "并按故障域测量多次发布的传播收敛时延（SLO）。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -453,4 +461,80 @@ def rollout_gate(request: RolloutGateRequest) -> RolloutGateResponse:
         peak_concurrent=peak,
         reason=reason,
         replicas=results,
+    )
+
+
+@app.post("/propagation-slo", response_model=PropagationSloResponse)
+def propagation_slo(
+    request: PropagationSloRequest,
+) -> PropagationSloResponse:
+    """传播 SLO：逐次发布测量各故障域达到该版本的收敛时延。
+
+    输入按时间严格递增的发布事件 ``releases``（``released_at`` + 发布
+    ``serial``）、带**非空** ``failure_domain`` 的副本观测，以及
+    ``deadline_seconds``。整体校验（422）：
+
+    * 副本名重复（``duplicate_replica_name``）；
+    * ``failure_domain`` 为空 / 空白（请求模型校验）；
+    * 发布时间戳重复或倒序（``duplicate_release_timestamp`` /
+      ``release_timestamp_out_of_order``）；
+    * 同一副本观测时间戳重复或倒序（``duplicate_observation_timestamp`` /
+      ``observation_timestamp_out_of_order``，缺失时间戳在本端点不允许）。
+
+    每次发布**只检查其到下一次发布前的窗口**
+    ``[released_at, next_released_at)``（最后一次发布无上界）：窗口外的
+    观测（早于本次发布、或已属于下一次发布窗口）不参与，窗口内到达状态
+    从零开始。按 RFC 1982 判断副本观测是否达到发布版本（``equal`` /
+    ``newer`` 为达到，``older`` / 正对点 ``ambiguous`` 不算，允许跨
+    2^32 回绕的 newer）；以各**故障域首个有效到达时间**中的最晚值作为
+    ``converged_at``，``latency_seconds = converged_at - released_at``，
+    不超过 ``deadline_seconds`` 则 ``met_deadline=true``。
+
+    已到达副本若在**收敛之前**出现 older / ambiguous 观测，该域本窗口的
+    到达状态失效（首个有效到达时间清空，须等待域内任一副本后续重新达到
+    并重新计时）；同一时间戳的观测作原子批处理（先统一失效、再统一重新
+    达到）。收敛之后窗口冻结，后续失到达不改变结果。窗口结束仍未覆盖
+    全部故障域时 ``converged_at=null``、``latency_seconds=null``、
+    ``met_deadline=false``，并在 ``missing_domains`` 给出未覆盖域名。
+    """
+    _check_duplicate_names([r.name for r in request.replicas])
+
+    try:
+        check_release_time_order([r.released_at for r in request.releases])
+        for replica in request.replicas:
+            check_observation_time_order(
+                replica.name, [o.timestamp for o in replica.observations]
+            )
+    except (ReleaseOrderError, ObservationOrderError) as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    outcomes = evaluate_propagation_slo(
+        [(r.released_at, r.serial) for r in request.releases],
+        [r.failure_domain for r in request.replicas],
+        [
+            [(o.timestamp, o.serial) for o in replica.observations]
+            for replica in request.replicas
+        ],
+        request.deadline_seconds,
+    )
+
+    return PropagationSloResponse(
+        deadline_seconds=request.deadline_seconds,
+        results=[
+            PropagationSloItem(
+                released_at=outcome["released_at"],
+                serial=outcome["serial"],
+                converged_at=outcome["converged_at"],
+                latency_seconds=outcome["latency_seconds"],
+                met_deadline=outcome["met_deadline"],
+                domain_reached_at=[
+                    DomainReachedAtItem(
+                        failure_domain=domain, reached_at=reached_at
+                    )
+                    for domain, reached_at in outcome["domain_reached_at"]
+                ],
+                missing_domains=outcome["missing_domains"],
+            )
+            for outcome in outcomes
+        ],
     )

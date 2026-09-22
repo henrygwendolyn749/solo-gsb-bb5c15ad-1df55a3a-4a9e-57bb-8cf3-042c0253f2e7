@@ -4,7 +4,8 @@
 对多个 DNS 副本当前持有的 32 位无符号 SOA 序列号与拟发布值进行推进审计，
 推导最优发布候选，规划各副本的 IXFR / AXFR 传输，
 在字节预算内选择要保留的增量集合（支持按故障域公平分配），
-并按时间序列观测对上线做 quorum 门禁判定。
+按时间序列观测对上线做 quorum 门禁判定，
+并按故障域测量多次发布的传播收敛时延（SLO）。
 
 ## 一条命令启动（Docker Compose）
 
@@ -536,6 +537,126 @@ curl -s http://localhost:8000/rollout-gate \
 # satisfied: false, reason: "quorum_exceeds_replicas", peak_concurrent: 2
 ```
 
+### `POST /propagation-slo` — 按故障域的传播收敛 SLO
+
+给定按时间**严格递增**的发布事件 `releases`（`released_at` + 发布 `serial`）、
+一组带**非空** `failure_domain` 的副本及其观测序列 `observations`
+（`timestamp` + `serial`，同一副本内时间戳必须严格递增），以及非负
+`deadline_seconds`：对每次发布测量所有故障域都传播到该版本的收敛时延。
+
+**每次发布只检查其到下一次发布前的窗口** `[released_at, next_released_at)`
+（最后一次发布的窗口无上界）：早于本次发布、或时间戳已等于 / 晚于下一次
+发布的观测都不属于本窗口；每个窗口内各副本的到达状态从零开始计算。
+
+- 按 RFC 1982 判断副本观测是否**达到**发布版本：序列号 `equal` 或 `newer`
+  即为达到（**允许跨 2³² 回绕**的 newer，如发布 `4294967295` 后观测到 `0`）；
+  `older` 与正对点 `ambiguous`（前向距离恰为 2³¹）不算达到。
+- 每个**故障域**的「首个有效到达时间」= 该域内任一副本给出达到观测的最早
+  时间戳（多副本取最早）。所有域首个有效到达时间中的**最晚值**即
+  `converged_at`，`latency_seconds = converged_at - released_at`，
+  `latency_seconds <= deadline_seconds` 时 `met_deadline` 为 `true`。
+- **失到达重计**：已到达副本若在**收敛之前**出现 `older` / `ambiguous`
+  观测，其故障域本窗口的到达状态立即失效（首个有效到达时间清空），必须等待
+  后续由域内**任一副本**重新给出达到观测，并以重新达到的时间重新计时。
+  同一时间戳的观测按原子批处理（先统一判定失到达、再统一判定重新达到），
+  结果不依赖同时间戳事件的排列顺序。
+- **收敛即冻结**：全部域在同一时间点均有有效到达即收敛；收敛之后再出现
+  `older` / `ambiguous` 不改变本次发布的结果。
+- 窗口结束仍未覆盖全部故障域时，`converged_at` / `latency_seconds` 为
+  `null`、`met_deadline` 为 `false`，并在 `missing_domains` 给出仍无有效
+  到达的故障域名（升序）；`domain_reached_at` 始终按故障域名升序列出逐域
+  的首个有效到达时间（未覆盖为 `null`）。
+
+请求：
+
+```bash
+curl -s http://localhost:8000/propagation-slo \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "deadline_seconds": 60,
+    "releases": [
+      {"released_at": 1000, "serial": 100},
+      {"released_at": 2000, "serial": 101}
+    ],
+    "replicas": [
+      {"name": "ns-a", "failure_domain": "dc-east", "observations": [
+        {"timestamp": 1010, "serial": 100},
+        {"timestamp": 2005, "serial": 101}
+      ]},
+      {"name": "ns-b", "failure_domain": "dc-west", "observations": [
+        {"timestamp": 1040, "serial": 100},
+        {"timestamp": 2060, "serial": 101}
+      ]}
+    ]
+  }'
+```
+
+响应（两次发布各自独立评估；第二次发布 `latency_seconds=60` 恰好等于
+`deadline_seconds`，故 `met_deadline` 仍为 `true`）：
+
+```json
+{
+  "deadline_seconds": 60,
+  "results": [
+    {"released_at": 1000, "serial": 100,
+     "converged_at": 1040, "latency_seconds": 40, "met_deadline": true,
+     "domain_reached_at": [
+       {"failure_domain": "dc-east", "reached_at": 1010},
+       {"failure_domain": "dc-west", "reached_at": 1040}
+     ],
+     "missing_domains": []},
+    {"released_at": 2000, "serial": 101,
+     "converged_at": 2060, "latency_seconds": 60, "met_deadline": true,
+     "domain_reached_at": [
+       {"failure_domain": "dc-east", "reached_at": 2005},
+       {"failure_domain": "dc-west", "reached_at": 2060}
+     ],
+     "missing_domains": []}
+  ]
+}
+```
+
+收敛前回退导致域到达失效、且窗口结束前未重新达到的例子（`ns-a` 在
+`1020` 达到后于 `1030` 回退为 `90`，`dc-east` 本窗口到达状态失效）：
+
+```bash
+curl -s http://localhost:8000/propagation-slo \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "deadline_seconds": 60,
+    "releases": [{"released_at": 1000, "serial": 100}],
+    "replicas": [
+      {"name": "ns-a", "failure_domain": "dc-east", "observations": [
+        {"timestamp": 1020, "serial": 100},
+        {"timestamp": 1030, "serial": 90}
+      ]},
+      {"name": "ns-b", "failure_domain": "dc-west", "observations": [
+        {"timestamp": 1015, "serial": 100}
+      ]}
+    ]
+  }'
+```
+
+```json
+{
+  "deadline_seconds": 60,
+  "results": [
+    {"released_at": 1000, "serial": 100,
+     "converged_at": null, "latency_seconds": null, "met_deadline": false,
+     "domain_reached_at": [
+       {"failure_domain": "dc-east", "reached_at": null},
+       {"failure_domain": "dc-west", "reached_at": 1015}
+     ],
+     "missing_domains": ["dc-east"]}
+  ]
+}
+```
+
+> 窗口边界为半开区间：观测时间戳恰好等于下一次发布时间时计入**下一次**
+> 发布的窗口。观测序列允许为空数组（该副本不提供任何观测，其所属域只能
+> 由同域其他副本覆盖）。全部排序键与域输出顺序固定，**相同输入恒得相同
+> 结果**。
+
 ### 输入校验（422）
 
 以下情况返回 **422 Unprocessable Entity**：
@@ -555,6 +676,13 @@ curl -s http://localhost:8000/rollout-gate \
   每个副本至少一条观测，观测 `serial` 必须是合法序列号；`timestamp` 若存在必须是
   非负整数，且同一副本内严格递增——重复（`duplicate_observation_timestamp`）
   或倒序（`observation_timestamp_out_of_order`）均返回 422。
+- `/propagation-slo` 额外检查：`deadline_seconds` 必须为非负整数；
+  `releases` 至少一次且 `released_at` 为非负整数、必须严格递增——重复
+  （`duplicate_release_timestamp`）或倒序（`release_timestamp_out_of_order`）
+  均返回 422；副本名重复（`duplicate_replica_name`）；`failure_domain`
+  必须为非空字符串（空白字符串同样被拒绝）；副本观测的 `timestamp` /
+  `serial` 类型与范围要求同 `/rollout-gate`，同一副本内观测时间戳重复或
+  倒序返回 422（观测序列本身允许为空数组）。
 
 ## 算法说明
 
@@ -606,6 +734,19 @@ priority 作为常量并入各域基值；对每个可行子集统计各域被�
 时间点即 `first_satisfied_at`，其后首个 `< quorum` 的时间点即
 `dropped_below_at`（只报告第一个满足区间）。
 
+`/propagation-slo` 中，每次发布只处理半开窗口
+`[released_at, next_released_at)` 内的观测（最后一次发布无上界），
+窗口间状态不继承：副本到达标记与各故障域的首个有效到达时间都从零计算。
+窗口内把全部副本观测合并为 `(timestamp, 副本下标, serial)` 事件并按
+`(时间戳, 副本下标)` 确定排序，再逐时间戳成批处理——同一时间戳先统一
+处理失到达（已到达副本出现 older / ambiguous 时清空其域的首个有效到达
+时间），再统一处理达到（首个达到的副本把时间戳记为该域的首个有效到达
+时间），故同时间戳的「回退 + 同域另一副本达到」可在一批内相互抵消，
+结果与事件输入顺序无关。每批结束后若所有域都持有有效到达时间即以各域
+时间的**最大值**为 `converged_at` 并立即冻结窗口；窗口结束仍有域缺失
+则 `converged_at=null` 并列出 `missing_domains`。域输出按故障域名升序，
+相同输入结果完全可复现。
+
 ## 测试
 
 核心环形算术不依赖 FastAPI，可直接用标准库运行（另含小位宽空间对暴力穷举的对照测试，
@@ -615,7 +756,10 @@ priority 作为常量并入各域基值；对每个可行子集统计各域被�
 向量优先于全体总和、域向量锚定与排序、覆盖数 / 字节 / 增量序列平局裁决、
 covered/total 汇总与稳定性测试，以及 `/rollout-gate` 的时间戳排序校验、
 相邻对 RFC 1982 标记、回绕推进、有效推进区间、事件扫掠 quorum 时间窗
-与 422 / OpenAPI 示例测试）：
+与 422 / OpenAPI 示例测试，`/propagation-slo` 的发布时间戳排序校验、
+半开窗口归属、equal/newer/older/ambiguous 与跨 2³² 回绕达到判定、
+故障域首个有效到达、失到达重计（含同时间戳原子批与收敛后冻结）、
+逐域输出 / missing_domains、deadline 边界与 422 / OpenAPI 示例测试）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -628,15 +772,18 @@ python3 -m unittest discover -s tests -v
 ├── app/
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由与异常（/audit、/propose、/transfer-plan、
-│   │                  #   /retention-plan、/domain-retention-plan、/rollout-gate）
-│   ├── schemas.py     # 请求/响应模型与 422 校验（含 /rollout-gate 的 OpenAPI 示例）
-│   └── serial.py      # RFC 1982 环形算术、增量链规划、保留规划与上线门禁
-│                      #   （纯函数，零第三方依赖）
+│   │                  #   /retention-plan、/domain-retention-plan、/rollout-gate、
+│   │                  #   /propagation-slo）
+│   ├── schemas.py     # 请求/响应模型与 422 校验（含 /rollout-gate、
+│   │                  #   /propagation-slo 的 OpenAPI 示例）
+│   └── serial.py      # RFC 1982 环形算术、增量链规划、保留规划、上线门禁与
+│                      #   传播 SLO（纯函数，零第三方依赖）
 ├── tests/test_serial.py
 ├── tests/test_transfer_plan.py
 ├── tests/test_retention_plan.py
 ├── tests/test_domain_retention_plan.py
 ├── tests/test_rollout_gate.py
+├── tests/test_propagation_slo.py
 ├── requirements.txt
 ├── Dockerfile
 ├── compose.yaml
