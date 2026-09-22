@@ -628,3 +628,207 @@ class RolloutGateResponse(BaseModel):
         ),
     )
     replicas: List[RolloutReplicaItem]
+
+
+# ---------------------------------------------------------------------------
+# POST /propagation-slo
+# ---------------------------------------------------------------------------
+
+
+class PropagationObservation(BaseModel):
+    """一条副本观测：时间戳（必填）+ 观测到的 SOA 序列号。"""
+
+    timestamp: int = Field(
+        ...,
+        description="观测时间戳（Unix 秒，非负整数）；同一副本内必须严格递增",
+    )
+    serial: int = Field(..., description="观测到的 32 位无符号 SOA 序列号")
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _timestamp_non_negative(cls, value: object) -> int:
+        return _coerce_non_negative_int(value, "观测时间戳")
+
+    @field_validator("serial", mode="before")
+    @classmethod
+    def _serial_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+
+class PropagationReplica(BaseModel):
+    """单个副本：名称 + 非空 failure_domain + 按时间严格递增的观测序列。"""
+
+    name: str = Field(..., min_length=1, description="副本名称（不可重复）")
+    failure_domain: str = Field(
+        ..., min_length=1, description="故障域标识（非空字符串，如机房 / 可用区）",
+    )
+    observations: List[PropagationObservation] = Field(
+        ...,
+        description=(
+            "按时间排序的观测序列（可为空）；时间戳必须严格递增，"
+            "重复或倒序返回 422"
+        ),
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("副本名称不能为空")
+        return value
+
+    @field_validator("failure_domain")
+    @classmethod
+    def _failure_domain_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("failure_domain 不能为空")
+        return value
+
+
+class ReleaseEvent(BaseModel):
+    """一次发布事件：发布的 SOA 序列号 + 发布时间（发布时间必须严格递增）。"""
+
+    serial: int = Field(..., description="本次发布的 32 位无符号 SOA 序列号")
+    released_at: int = Field(
+        ...,
+        description="发布时间戳（Unix 秒，非负整数）；各发布之间必须严格递增",
+    )
+
+    @field_validator("serial", mode="before")
+    @classmethod
+    def _serial_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+    @field_validator("released_at", mode="before")
+    @classmethod
+    def _released_at_non_negative(cls, value: object) -> int:
+        return _coerce_non_negative_int(value, "发布时间戳")
+
+
+class PropagationSloRequest(BaseModel):
+    """POST /propagation-slo 请求体。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "deadline_seconds": 300,
+                    "releases": [
+                        {"serial": 2024092101, "released_at": 1000},
+                        {"serial": 2024092102, "released_at": 2000},
+                    ],
+                    "replicas": [
+                        {
+                            "name": "ns-a",
+                            "failure_domain": "dc-east",
+                            "observations": [
+                                {"timestamp": 1000, "serial": 2024092100},
+                                {"timestamp": 1120, "serial": 2024092101},
+                                {"timestamp": 2050, "serial": 2024092102},
+                            ],
+                        },
+                        {
+                            "name": "ns-b",
+                            "failure_domain": "dc-west",
+                            "observations": [
+                                {"timestamp": 1180, "serial": 2024092101},
+                                {"timestamp": 1900, "serial": 2024092101},
+                            ],
+                        },
+                        {
+                            "name": "ns-c",
+                            "failure_domain": "dc-west",
+                            "observations": [
+                                {"timestamp": 1250, "serial": 2024092101},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "deadline_seconds": 100,
+                    "releases": [{"serial": 10, "released_at": 0}],
+                    "replicas": [
+                        {
+                            "name": "ns-a",
+                            "failure_domain": "dc-east",
+                            "observations": [
+                                {"timestamp": 10, "serial": 10},
+                                {"timestamp": 20, "serial": 9},
+                                {"timestamp": 50, "serial": 10},
+                            ],
+                        },
+                        {
+                            "name": "ns-b",
+                            "failure_domain": "dc-west",
+                            "observations": [
+                                {"timestamp": 30, "serial": 10},
+                            ],
+                        },
+                    ],
+                },
+            ]
+        }
+    )
+
+    deadline_seconds: int = Field(
+        ...,
+        description=(
+            "传播 SLO 时限（非负整数，秒）："
+            "converged_at - released_at 不超过它即达标"
+        ),
+    )
+    releases: List[ReleaseEvent] = Field(
+        ...,
+        min_length=1,
+        description="按时间严格递增的发布事件序列（至少一条）",
+    )
+    replicas: List[PropagationReplica] = Field(..., min_length=1)
+
+    @field_validator("deadline_seconds", mode="before")
+    @classmethod
+    def _deadline_non_negative(cls, value: object) -> int:
+        return _coerce_non_negative_int(value, "deadline_seconds")
+
+
+class PropagationDomainStatus(BaseModel):
+    """单个故障域在一次发布窗口内的到达结果（按 failure_domain 名称升序）。"""
+
+    failure_domain: str
+    reached_at: Optional[int] = Field(
+        ...,
+        description="该域首个有效到达时间（Unix 秒）；窗口结束时仍未到达为 null",
+    )
+
+
+class PropagationReleaseItem(BaseModel):
+    """单次发布的传播 SLO 评估结果（顺序与请求中的发布一致）。"""
+
+    serial: int
+    released_at: int
+    converged_at: Optional[int] = Field(
+        ...,
+        description=(
+            "全部故障域均到达的最早时间（等于各域 reached_at 的最晚值）；"
+            "窗口结束仍未覆盖全部域为 null"
+        ),
+    )
+    latency_seconds: Optional[int] = Field(
+        ..., description="converged_at - released_at；未收敛为 null",
+    )
+    met_deadline: bool = Field(
+        ...,
+        description="latency_seconds <= deadline_seconds；未收敛为 false",
+    )
+    domains: List[PropagationDomainStatus] = Field(
+        ..., description="逐故障域到达结果（按 failure_domain 名称升序）",
+    )
+    missing_domains: List[str] = Field(
+        ..., description="窗口结束时仍未到达的故障域（按名称升序）；收敛时为空",
+    )
+
+
+class PropagationSloResponse(BaseModel):
+    """POST /propagation-slo 响应体。"""
+
+    deadline_seconds: int
+    releases: List[PropagationReleaseItem]

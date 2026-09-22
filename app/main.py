@@ -15,6 +15,10 @@ from .schemas import (
     DomainSummary,
     ObservationTransition,
     OrderedDelta,
+    PropagationDomainStatus,
+    PropagationReleaseItem,
+    PropagationSloRequest,
+    PropagationSloResponse,
     ProposeItem,
     ProposeRequest,
     ProposeResponse,
@@ -35,8 +39,10 @@ from .serial import (
     build_delta_chain,
     build_sized_delta_chain,
     check_observation_time_order,
+    check_release_time_order,
     compare_serial,
     DeltaValidationError,
+    evaluate_propagation_slo,
     evaluate_rollout_gate,
     forward_distance,
     ObservationOrderError,
@@ -44,6 +50,7 @@ from .serial import (
     plan_retention,
     plan_transfer,
     propose_serial,
+    ReleaseOrderError,
 )
 
 app = FastAPI(
@@ -52,9 +59,10 @@ app = FastAPI(
         "基于 RFC 1982 环形算术，对多个 DNS 副本的 SOA 序列号推进进行审计，"
         "推导对所有副本都严格更新的最佳拟发布值，规划增量 / 全量传输，"
         "在字节预算内选择要保留的增量集合（支持按故障域公平分配），"
-        "并按时间序列观测对上线做 quorum 门禁判定。"
+        "并按时间序列观测对上线做 quorum 门禁判定、"
+        "评估每次发布在各故障域间的传播收敛时延（SLO）。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -453,4 +461,84 @@ def rollout_gate(request: RolloutGateRequest) -> RolloutGateResponse:
         peak_concurrent=peak,
         reason=reason,
         replicas=results,
+    )
+
+
+@app.post("/propagation-slo", response_model=PropagationSloResponse)
+def propagation_slo(request: PropagationSloRequest) -> PropagationSloResponse:
+    """传播 SLO：评估每次发布在其窗口内向各故障域的收敛时延。
+
+    发布事件按 ``released_at`` **严格递增**（重复或倒序返回 422
+    ``duplicate_release_timestamp`` / ``release_timestamp_out_of_order``）；
+    每个副本的观测时间戳同样必须严格递增（复用
+    ``duplicate_observation_timestamp`` / ``observation_timestamp_out_of_order``）。
+
+    对第 i 次发布，窗口为左闭右开 ``[released_at[i], released_at[i+1])``
+    （最后一次发布延伸到观测结束）；**只**用窗口内的观测判定，各窗口的
+    到达状态相互独立。窗口内每条观测按 RFC 1982 相对本次发布版本分类：
+
+    * ``equal`` / ``newer``：副本**到达**该版本——其故障域若尚未到达，
+      以该观测时间为域的 ``reached_at``（首个有效到达）；
+    * ``older`` / ``ambiguous``：若该副本**已到达**，其到达状态失效，
+      且所在故障域的本窗口到达状态一并失效，须等待后续重新到达
+      （同一时间戳的事件先处理回退再处理到达）。
+
+    全部故障域都到达的最早时刻即 ``converged_at``（等于各域
+    ``reached_at`` 的最晚值），之后的回退不再影响结果；
+    ``latency_seconds = converged_at - released_at``，
+    ``met_deadline = latency_seconds <= deadline_seconds``。
+    窗口结束仍未覆盖全部域时 ``converged_at`` 与 ``latency_seconds``
+    为 null、``met_deadline`` 为 false，并给出升序的 ``missing_domains``。
+    """
+    _check_duplicate_names([r.name for r in request.replicas])
+
+    try:
+        check_release_time_order([r.released_at for r in request.releases])
+        for replica in request.replicas:
+            check_observation_time_order(
+                replica.name, [o.timestamp for o in replica.observations]
+            )
+    except (ReleaseOrderError, ObservationOrderError) as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    outcomes = evaluate_propagation_slo(
+        [(r.serial, r.released_at) for r in request.releases],
+        [
+            (
+                replica.name,
+                replica.failure_domain,
+                [(o.timestamp, o.serial) for o in replica.observations],
+            )
+            for replica in request.replicas
+        ],
+        request.deadline_seconds,
+    )
+
+    return PropagationSloResponse(
+        deadline_seconds=request.deadline_seconds,
+        releases=[
+            PropagationReleaseItem(
+                serial=serial,
+                released_at=released_at,
+                converged_at=converged_at,
+                latency_seconds=latency_seconds,
+                met_deadline=met_deadline,
+                domains=[
+                    PropagationDomainStatus(
+                        failure_domain=domain, reached_at=reached_at
+                    )
+                    for domain, reached_at in domain_status
+                ],
+                missing_domains=missing_domains,
+            )
+            for (
+                serial,
+                released_at,
+                converged_at,
+                latency_seconds,
+                met_deadline,
+                domain_status,
+                missing_domains,
+            ) in outcomes
+        ],
     )

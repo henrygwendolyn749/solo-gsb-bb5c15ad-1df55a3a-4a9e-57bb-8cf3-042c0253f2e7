@@ -822,3 +822,197 @@ def evaluate_rollout_gate(
     else:
         reason = QUORUM_NEVER_REACHED
     return results, satisfied, first_satisfied_at, dropped_below_at, peak, reason
+
+
+# ---------------------------------------------------------------------------
+# 传播 SLO（POST /propagation-slo）
+# ---------------------------------------------------------------------------
+
+REACH = "reach"
+"""窗口内观测达到发布版本（equal 或 newer）：副本进入“已到达”状态。"""
+
+REGRESS = "regress"
+"""窗口内观测相对发布版本为 older 或 ambiguous：已到达副本的到达状态失效。"""
+
+DUPLICATE_RELEASE_TIMESTAMP = "duplicate_release_timestamp"
+"""相邻两次发布的 released_at 相同（发布时间必须严格递增）。"""
+
+RELEASE_TIMESTAMP_OUT_OF_ORDER = "release_timestamp_out_of_order"
+"""发布的 released_at 小于前一次发布（发布时间必须严格递增）。"""
+
+
+class ReleaseOrderError(ValueError):
+    """发布事件的 released_at 重复或倒序。"""
+
+    def __init__(self, detail: dict):
+        super().__init__(str(detail))
+        self.detail = detail
+
+
+def check_release_time_order(released_ats: List[int]) -> None:
+    """校验发布事件时间严格递增。
+
+    重复（与前一次发布相等）抛出 error=duplicate_release_timestamp；
+    倒序（小于前一次发布）抛出 error=release_timestamp_out_of_order。
+    两者均为 :class:`ReleaseOrderError`，由路由层转为 422。
+    """
+    prev_index = -1
+    prev: Optional[int] = None
+    for index, ts in enumerate(released_ats):
+        if prev is not None:
+            if ts == prev:
+                raise ReleaseOrderError(
+                    {
+                        "error": DUPLICATE_RELEASE_TIMESTAMP,
+                        "message": (
+                            f"发布事件时间戳重复：{ts}"
+                            f"（下标 {prev_index} 与 {index}），发布时间必须严格递增"
+                        ),
+                        "index": index,
+                        "timestamp": ts,
+                    }
+                )
+            if ts < prev:
+                raise ReleaseOrderError(
+                    {
+                        "error": RELEASE_TIMESTAMP_OUT_OF_ORDER,
+                        "message": (
+                            f"发布事件时间戳必须严格递增："
+                            f"下标 {prev_index} 为 {prev}，下标 {index} 为 {ts}"
+                        ),
+                        "index": index,
+                        "timestamp": ts,
+                        "previous_timestamp": prev,
+                    }
+                )
+        prev = ts
+        prev_index = index
+
+
+def evaluate_release_window(
+    serial: int,
+    released_at: int,
+    window_end: Optional[int],
+    domains: List[str],
+    replica_observations: List[Tuple[str, str, List[Tuple[int, int]]]],
+) -> Tuple[Optional[int], List[Tuple[str, Optional[int]]], List[str]]:
+    """评估单次发布在其窗口内的逐故障域到达与收敛。
+
+    *serial* / *released_at* 为本次发布的版本与发布时间；*window_end* 为下一次
+    发布的发布时间（窗口为左闭右开 ``[released_at, window_end)``），最后一次
+    发布传 None（窗口延伸到观测结束）。*domains* 为按名称升序的全部故障域；
+    *replica_observations* 为 ``(副本名, failure_domain, [(timestamp, serial)])``
+    列表（观测时间已校验严格递增，副本名已校验不重复）。
+
+    窗口内每条观测按 RFC 1982 相对本次发布版本分类为事件：
+
+    * ``equal`` / ``newer``：**到达**事件——副本进入已到达状态；若其故障域
+      当前未到达，该域以本事件时间为 reached_at（首个有效到达）；
+    * ``older`` / ``ambiguous``：**回退**事件——若该副本当前处于已到达状态，
+      其到达状态失效，且**所在故障域的本窗口到达状态一并失效**（reached_at
+      清空），须等待后续到达事件重新到达；未到达副本的回退无影响。
+
+    同一时间戳的事件先处理回退再处理到达：回退只使**早于**该时刻的到达失效，
+    同时刻的到达仍然有效。首次全部故障域都处于已到达状态的时间戳即
+    converged_at（此时必等于各域 reached_at 的最大值），扫描随即停止，
+    之后的回退不再影响结果。
+
+    返回 ``(converged_at, domain_status, missing_domains)``：``domain_status``
+    与 *domains* 同序（按域名升序），每项为 ``(failure_domain, reached_at)``
+    （窗口结束时仍未到达的域 reached_at 为 None）；``missing_domains`` 为
+    窗口结束时仍未到达的故障域（升序），收敛时为空。
+    """
+    # 收集窗口内事件：(时间戳, 回退=0/到达=1, 事件类型, 副本名, 故障域)
+    events: List[Tuple[int, int, str, str, str]] = []
+    for name, domain, observations in replica_observations:
+        for ts, obs_serial in observations:
+            if ts < released_at:
+                continue
+            if window_end is not None and ts >= window_end:
+                continue
+            relation = compare_serial(serial, obs_serial)
+            kind = REACH if relation in (EQUAL, NEWER) else REGRESS
+            events.append((ts, 0 if kind == REGRESS else 1, kind, name, domain))
+    # 同一时间戳先处理回退（0）再处理到达（1）；再按副本名保证完全确定
+    events.sort(key=lambda event: (event[0], event[1], event[3]))
+
+    replica_arrived = {name: False for name, _domain, _obs in replica_observations}
+    reached_at: dict = {domain: None for domain in domains}
+    arrived_domains = 0
+    converged_at: Optional[int] = None
+    index = 0
+    while index < len(events):
+        ts = events[index][0]
+        # 处理该时间戳的全部事件后再判定收敛（同时刻事件视为同时发生）
+        while index < len(events) and events[index][0] == ts:
+            _t, _order, kind, name, domain = events[index]
+            if kind == REACH:
+                replica_arrived[name] = True
+                if reached_at[domain] is None:
+                    reached_at[domain] = ts
+                    arrived_domains += 1
+            else:  # REGRESS：仅“已到达副本”的回退使所在域到达状态失效
+                if replica_arrived[name]:
+                    replica_arrived[name] = False
+                    if reached_at[domain] is not None:
+                        reached_at[domain] = None
+                        arrived_domains -= 1
+            index += 1
+        if arrived_domains == len(domains):
+            converged_at = ts
+            break
+
+    domain_status = [(domain, reached_at[domain]) for domain in domains]
+    missing = [domain for domain in domains if reached_at[domain] is None]
+    return converged_at, domain_status, missing
+
+
+def evaluate_propagation_slo(
+    releases: List[Tuple[int, int]],
+    replicas: List[Tuple[str, str, List[Tuple[int, int]]]],
+    deadline_seconds: int,
+) -> List[Tuple[int, int, Optional[int], Optional[int], bool, list, List[str]]]:
+    """对每次发布评估其到下一次发布前窗口内的传播收敛。
+
+    *releases* 为 ``(serial, released_at)`` 列表，released_at 必须严格递增
+    （由 :func:`check_release_time_order` 事先校验）；*replicas* 为
+    ``(副本名, failure_domain, [(timestamp, serial)])`` 列表；
+    *deadline_seconds* 为非负整数。
+
+    每次发布只检查窗口 ``[released_at[i], released_at[i+1])``（最后一次发布
+    延伸到观测结束），各窗口的到达状态相互独立、互不带入。
+
+    返回与 *releases* 同序的结果列表，每项为
+    ``(serial, released_at, converged_at, latency_seconds, met_deadline,
+    domain_status, missing_domains)``：
+
+    * 收敛时 ``latency_seconds = converged_at - released_at``，
+      ``met_deadline = latency_seconds <= deadline_seconds``；
+    * 窗口结束仍未覆盖全部域时 ``converged_at`` 与 ``latency_seconds`` 为
+      None，``met_deadline`` 为 False，``missing_domains`` 给出未到达的域。
+    """
+    domains = sorted({domain for _name, domain, _obs in replicas})
+    results = []
+    for idx, (serial, released_at) in enumerate(releases):
+        window_end = releases[idx + 1][1] if idx + 1 < len(releases) else None
+        converged_at, domain_status, missing = evaluate_release_window(
+            serial, released_at, window_end, domains, replicas
+        )
+        if converged_at is None:
+            latency_seconds = None
+            met_deadline = False
+        else:
+            latency_seconds = converged_at - released_at
+            met_deadline = latency_seconds <= deadline_seconds
+        results.append(
+            (
+                serial,
+                released_at,
+                converged_at,
+                latency_seconds,
+                met_deadline,
+                domain_status,
+                missing,
+            )
+        )
+    return results
